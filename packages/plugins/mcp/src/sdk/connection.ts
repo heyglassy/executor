@@ -1,4 +1,3 @@
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -14,6 +13,11 @@ import { Effect } from "effect";
 
 import type { McpRemoteSourceData, McpStdioSourceData } from "./types";
 import { McpConnectionError } from "./errors";
+import {
+  classifyMcpConnectFailure,
+  type McpConnectFailure,
+  type OAuthClientProvider,
+} from "./error-classification";
 
 // ---------------------------------------------------------------------------
 // Connection type
@@ -24,7 +28,7 @@ export type McpConnection = {
   readonly close: () => Promise<void>;
 };
 
-export type McpConnector = Effect.Effect<McpConnection, McpConnectionError>;
+export type McpConnector = Effect.Effect<McpConnection, McpConnectFailure>;
 
 // ---------------------------------------------------------------------------
 // Connector input — extends stored source data with resolved auth
@@ -65,20 +69,14 @@ const connectionFromClient = (client: Client): McpConnection => ({
 const connectClient = (input: {
   transport: string;
   createTransport: () => Parameters<Client["connect"]>[0];
-}): Effect.Effect<McpConnection, McpConnectionError> =>
+}): Effect.Effect<McpConnection, McpConnectFailure> =>
   Effect.gen(function* () {
     const client = createClient();
     const transportInstance = input.createTransport();
 
     yield* Effect.tryPromise({
       try: () => client.connect(transportInstance),
-      catch: (cause) =>
-        new McpConnectionError({
-          transport: input.transport,
-          message: `Failed connecting via ${input.transport}: ${
-            cause instanceof Error ? cause.message : String(cause)
-          }`,
-        }),
+      catch: (cause) => classifyMcpConnectFailure(input.transport, cause),
     }).pipe(
       Effect.withSpan("plugin.mcp.connection.handshake", {
         attributes: { "plugin.mcp.transport": input.transport },
@@ -159,6 +157,10 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
   if (remoteTransport === "streamable-http") return connectStreamableHttp;
   if (remoteTransport === "sse") return connectSse;
 
-  // auto — try streamable-http first, fall back to SSE
-  return connectStreamableHttp.pipe(Effect.catchAll(() => connectSse));
+  // auto — try streamable-http first, fall back to SSE unless auth failed.
+  return connectStreamableHttp.pipe(
+    Effect.catchAll((error) =>
+      error instanceof McpConnectionError ? connectSse : Effect.fail(error),
+    ),
+  );
 };

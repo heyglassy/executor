@@ -4,6 +4,7 @@ import { ScopeId } from "@executor/sdk";
 import { InternalError } from "@executor/api";
 
 import {
+  McpAuthenticationError,
   McpConnectionError,
   McpOAuthError,
   McpToolDiscoveryError,
@@ -98,6 +99,7 @@ const ProbeEndpointPayload = Schema.Struct({
 
 const ProbeEndpointResponse = Schema.Struct({
   connected: Schema.Boolean,
+  requiresAuthentication: Schema.Boolean,
   requiresOAuth: Schema.Boolean,
   name: Schema.String,
   namespace: Schema.String,
@@ -241,5 +243,6 @@ export class McpGroup extends HttpApiGroup.make("mcp")
   // endpoint, not any MCP-group endpoint, so it doesn't belong here.
   .addError(InternalError)
   .addError(McpOAuthError)
+  .addError(McpAuthenticationError)
   .addError(McpConnectionError)
   .addError(McpToolDiscoveryError) {}

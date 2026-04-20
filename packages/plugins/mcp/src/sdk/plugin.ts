@@ -32,10 +32,12 @@ import {
 } from "./connection";
 import { discoverTools } from "./discover";
 import {
+  McpAuthenticationError,
   McpConnectionError,
   McpOAuthError,
   McpToolDiscoveryError,
 } from "./errors";
+import type { McpConnectFailure } from "./error-classification";
 import { invokeMcpTool } from "./invoke";
 import {
   deriveMcpNamespace,
@@ -149,6 +151,7 @@ export interface McpOAuthCompleteResponse {
 
 export interface McpProbeResult {
   readonly connected: boolean;
+  readonly requiresAuthentication: boolean;
   readonly requiresOAuth: boolean;
   readonly name: string;
   readonly namespace: string;
@@ -292,6 +295,12 @@ const toMcpErrorMessage = (error: unknown): string =>
 const mcpDiscoveryError = (message: string) =>
   new McpToolDiscoveryError({ stage: "list_tools", message });
 
+const preserveAuthenticationError = <E extends { readonly message: string }>(
+  error: McpAuthenticationError | E,
+  fallback: (message: string) => E,
+): McpAuthenticationError | E =>
+  error instanceof McpAuthenticationError ? error : fallback(error.message);
+
 // ---------------------------------------------------------------------------
 // Shared connector resolution — reads secrets, builds stdio/remote input
 // ---------------------------------------------------------------------------
@@ -418,11 +427,11 @@ interface McpRuntime {
   readonly connectionCache: ScopedCache.ScopedCache<
     string,
     McpConnection,
-    McpConnectionError
+    McpConnectFailure
   >;
   readonly pendingConnectors: Map<
     string,
-    Effect.Effect<McpConnection, McpConnectionError>
+    Effect.Effect<McpConnection, McpConnectFailure>
   >;
   readonly cacheScope: Scope.CloseableScope;
 }
@@ -432,7 +441,7 @@ const makeRuntime = (): Effect.Effect<McpRuntime, never> =>
     const cacheScope = yield* Scope.make();
     const pendingConnectors = new Map<
       string,
-      Effect.Effect<McpConnection, McpConnectionError>
+      Effect.Effect<McpConnection, McpConnectFailure>
     >();
     const connectionCache = yield* ScopedCache.make({
       lookup: (key: string) =>
@@ -576,21 +585,41 @@ export const mcpPlugin = definePlugin(
             });
 
             const result = yield* discoverTools(connector).pipe(
-              Effect.map((m) => ({ ok: true as const, manifest: m })),
-              Effect.catchAll(() =>
-                Effect.succeed({ ok: false as const, manifest: null }),
-              ),
+              Effect.either,
               Effect.withSpan("mcp.plugin.discover_tools"),
             );
 
-            if (result.ok && result.manifest) {
+            if (result._tag === "Right") {
               return {
                 connected: true,
+                requiresAuthentication: false,
                 requiresOAuth: false,
-                name: result.manifest.server?.name ?? name,
+                name: result.right.server?.name ?? name,
                 namespace,
-                toolCount: result.manifest.tools.length,
-                serverName: result.manifest.server?.name ?? null,
+                toolCount: result.right.tools.length,
+                serverName: result.right.server?.name ?? null,
+              } satisfies McpProbeResult;
+            }
+
+            if (result.left instanceof McpAuthenticationError) {
+              const hasOAuth = yield* startMcpOAuthAuthorization({
+                endpoint: trimmed,
+                redirectUrl: "http://127.0.0.1/executor/discovery/oauth/probe",
+                state: "probe",
+              }).pipe(
+                Effect.map(() => true),
+                Effect.catchAll(() => Effect.succeed(false)),
+                Effect.withSpan("mcp.plugin.probe_oauth"),
+              );
+
+              return {
+                connected: false,
+                requiresAuthentication: true,
+                requiresOAuth: hasOAuth,
+                name,
+                namespace,
+                toolCount: null,
+                serverName: null,
               } satisfies McpProbeResult;
             }
 
@@ -607,6 +636,7 @@ export const mcpPlugin = definePlugin(
             if (hasOAuth) {
               return {
                 connected: false,
+                requiresAuthentication: true,
                 requiresOAuth: true,
                 name,
                 namespace,
@@ -649,8 +679,10 @@ export const mcpPlugin = definePlugin(
             // their list and can retry via refresh. The error still
             // propagates to the caller so boot-time sync logs the reason.
             const discovery = yield* discoverTools(connector).pipe(
-              Effect.mapError((err) =>
-                mcpDiscoveryError(`MCP discovery failed: ${err.message}`),
+              Effect.mapError((error) =>
+                preserveAuthenticationError(error, (message) =>
+                  mcpDiscoveryError(`MCP discovery failed: ${message}`),
+                ),
               ),
               Effect.either,
               Effect.withSpan("mcp.plugin.discover_tools", {
@@ -784,8 +816,10 @@ export const mcpPlugin = definePlugin(
               }),
             );
             const manifest = yield* discoverTools(createMcpConnector(ci)).pipe(
-              Effect.mapError((err) =>
-                mcpDiscoveryError(`MCP refresh failed: ${err.message}`),
+              Effect.mapError((error) =>
+                preserveAuthenticationError(error, (message) =>
+                  mcpDiscoveryError(`MCP refresh failed: ${message}`),
+                ),
               ),
               Effect.withSpan("mcp.plugin.discover_tools", {
                 attributes: { "mcp.source.namespace": namespace },
@@ -1113,7 +1147,7 @@ export const mcpPlugin = definePlugin(
               resolveConnectorInput(sd, ctx, allowStdio).pipe(
                 Effect.flatMap((ci) => createMcpConnector(ci)),
                 Effect.mapError((err) =>
-                  err instanceof McpConnectionError
+                  err instanceof McpAuthenticationError || err instanceof McpConnectionError
                     ? err
                     : new McpConnectionError({
                         transport: "auto",
@@ -1161,7 +1195,11 @@ export const mcpPlugin = definePlugin(
 
           const connected = yield* discoverTools(connector).pipe(
             Effect.map(() => true),
-            Effect.catchAll(() => Effect.succeed(false)),
+            Effect.catchAll((error) =>
+              error instanceof McpAuthenticationError
+                ? Effect.fail(error)
+                : Effect.succeed(false),
+            ),
             Effect.withSpan("mcp.plugin.discover_tools"),
           );
 
@@ -1244,7 +1282,7 @@ export const mcpPlugin = definePlugin(
 // ---------------------------------------------------------------------------
 
 /**
- * Errors any MCP extension method may surface. The first four are
+ * Errors any MCP extension method may surface. The first five are
  * plugin-domain tagged errors that flow directly to clients (4xx, each
  * carrying its own `HttpApiSchema` status). `StorageFailure` covers
  * raw backend failures (`StorageError`) plus `UniqueViolationError`;
@@ -1255,6 +1293,7 @@ export const mcpPlugin = definePlugin(
  */
 export type McpExtensionFailure =
   | McpOAuthError
+  | McpAuthenticationError
   | McpConnectionError
   | McpToolDiscoveryError
   | StorageFailure;

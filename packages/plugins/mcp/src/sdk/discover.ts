@@ -5,7 +5,8 @@
 import { Effect } from "effect";
 
 import type { McpConnector } from "./connection";
-import { McpToolDiscoveryError } from "./errors";
+import { McpAuthenticationError, McpToolDiscoveryError } from "./errors";
+import { classifyMcpAuthenticationError } from "./error-classification";
 import { extractManifestFromListToolsResult, type McpToolManifest } from "./manifest";
 
 // ---------------------------------------------------------------------------
@@ -18,36 +19,38 @@ import { extractManifestFromListToolsResult, type McpToolManifest } from "./mani
  */
 export const discoverTools = (
   connector: McpConnector,
-): Effect.Effect<McpToolManifest, McpToolDiscoveryError> =>
+): Effect.Effect<McpToolManifest, McpAuthenticationError | McpToolDiscoveryError> =>
   Effect.gen(function* () {
-    // Acquire connection
     const connection = yield* connector.pipe(
-      Effect.mapError(
-        (err) =>
-          new McpToolDiscoveryError({
-            stage: "connect",
-            message: `Failed connecting to MCP server: ${err.message}`,
-          }),
+      Effect.mapError((err) =>
+        err instanceof McpAuthenticationError
+          ? err
+          : new McpToolDiscoveryError({
+              stage: "connect",
+              message: `Failed connecting to MCP server: ${err.message}`,
+            }),
       ),
     );
 
-    // List tools
     const listResult = yield* Effect.tryPromise({
       try: () => connection.client.listTools(),
-      catch: (cause) =>
-        new McpToolDiscoveryError({
-          stage: "list_tools",
-          message: `Failed listing MCP tools: ${
-            cause instanceof Error ? cause.message : String(cause)
-          }`,
-        }),
+      catch: (cause) => {
+        const authenticationError = classifyMcpAuthenticationError("remote", cause);
+        return authenticationError
+          ? authenticationError
+          : new McpToolDiscoveryError({
+              stage: "list_tools",
+              message: `Failed listing MCP tools: ${
+                cause instanceof Error ? cause.message : String(cause)
+              }`,
+            });
+      },
     });
 
     const manifest = extractManifestFromListToolsResult(listResult, {
       serverInfo: connection.client.getServerVersion?.(),
     });
 
-    // Close the connection after discovery
     yield* Effect.promise(() => connection.close().catch(() => {}));
 
     return manifest;
