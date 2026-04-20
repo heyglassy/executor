@@ -6,6 +6,15 @@
 import { Schema } from "effect";
 import { HttpApiSchema } from "@effect/platform";
 
+export class McpAuthenticationError extends Schema.TaggedError<McpAuthenticationError>()(
+  "McpAuthenticationError",
+  {
+    transport: Schema.String,
+    message: Schema.String,
+  },
+  HttpApiSchema.annotations({ status: 401 }),
+) {}
+
 export class McpConnectionError extends Schema.TaggedError<McpConnectionError>()(
   "McpConnectionError",
   {

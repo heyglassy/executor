@@ -83,6 +83,30 @@ const resolveCapture = Effect.serviceOption(ErrorCapture).pipe(
   ),
 );
 
+const declaredErrorSchema = <
+  Id extends string,
+  Groups extends HttpApiGroup.HttpApiGroup.Any,
+  E,
+  R,
+>(
+  api: HttpApi.HttpApi<Id, Groups, E, R>,
+): Schema.Schema<unknown> => {
+  const schemas = new Set<Schema.Schema.Any>();
+  HttpApiSchema.deunionize(schemas, api.errorSchema);
+  for (const group of Object.values(api.groups)) {
+    for (const endpoint of Object.values(group.endpoints)) {
+      HttpApiSchema.deunionize(schemas, endpoint.errorSchema);
+    }
+    HttpApiSchema.deunionize(schemas, group.errorSchema);
+  }
+  const members = Array.from(schemas);
+  return members.length === 0
+    ? Schema.Never
+    : members.length === 1
+      ? members[0]
+      : Schema.Union(...members);
+};
+
 /**
  * HTTP-edge translator for `StorageFailure` on a single Effect. Two
  * cases:
@@ -169,16 +193,21 @@ export const observabilityMiddleware = <
     api,
     Effect.gen(function* () {
       const c = yield* resolveCapture;
+      const isDeclaredError = Schema.is(declaredErrorSchema(api));
       return (httpApp) =>
-        Effect.catchAllCause(httpApp, (cause) =>
-          Effect.gen(function* () {
+        Effect.catchAllCause(httpApp, (cause) => {
+          const error = Cause.squash(cause);
+          if (isDeclaredError(error)) {
+            return Effect.failCause(cause);
+          }
+          return Effect.gen(function* () {
             const traceId = yield* c.captureException(cause);
             return HttpServerResponse.unsafeJson(
               new InternalError({ traceId }),
               { status: 500 },
             );
-          }),
-        );
+          });
+        });
     }),
     { withContext: true },
   );

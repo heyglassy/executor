@@ -41,6 +41,7 @@ type RemoteAuthMode = "none" | "header" | "oauth2";
 import { sourceWriteKeys } from "@executor/react/api/reactivity-keys";
 import { usePendingSources } from "@executor/react/api/optimistic";
 import { probeMcpEndpoint, addMcpSource, startMcpOAuth } from "./atoms";
+import { extractMcpClientErrorMessage } from "./error-message";
 import { mcpPresets, type McpPreset } from "../sdk/presets";
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,7 @@ type OAuthTokens = {
 
 type ProbeResult = {
   connected: boolean;
+  requiresAuthentication: boolean;
   requiresOAuth: boolean;
   name: string;
   namespace: string;
@@ -376,7 +378,7 @@ export default function AddMcpSource(props: {
   const isProbing = state.step === "probing";
   const isAdding = state.step === "adding";
   const isOAuthBusy = state.step === "oauth-starting" || state.step === "oauth-waiting";
-  const canUseNone = probe?.requiresOAuth !== true;
+  const canUseNone = probe?.requiresAuthentication !== true;
   const remoteAuthHeader = remoteAuthHeaders[0];
   const headerAuthComplete = Boolean(remoteAuthHeader?.name.trim() && remoteAuthHeader?.secretId);
   const remoteHeadersComplete = remoteHeaders.every(
@@ -403,12 +405,14 @@ export default function AddMcpSource(props: {
         path: { scopeId },
         payload: { endpoint: state.url.trim() },
       });
-      setRemoteAuthMode(result.requiresOAuth ? "oauth2" : "none");
+      setRemoteAuthMode(
+        result.requiresOAuth ? "oauth2" : result.requiresAuthentication ? "header" : "none",
+      );
       dispatch({ type: "probe-ok", probe: result });
     } catch (e) {
       dispatch({
         type: "probe-fail",
-        error: e instanceof Error ? e.message : "Failed to connect",
+        error: await extractMcpClientErrorMessage(e, "Failed to connect"),
       });
     }
   }, [state.url, scopeId, doProbe]);
@@ -484,7 +488,7 @@ export default function AddMcpSource(props: {
     } catch (e) {
       dispatch({
         type: "oauth-fail",
-        error: e instanceof Error ? e.message : "Failed to start OAuth",
+        error: await extractMcpClientErrorMessage(e, "Failed to start OAuth"),
       });
     }
   }, [state.url, scopeId, doStartOAuth, remoteIdentity.namespace, probe?.namespace]);
@@ -551,7 +555,7 @@ export default function AddMcpSource(props: {
     } catch (e) {
       dispatch({
         type: "add-fail",
-        error: e instanceof Error ? e.message : "Failed to add source",
+        error: await extractMcpClientErrorMessage(e, "Failed to add source"),
       });
     } finally {
       placeholder.done();
@@ -623,7 +627,7 @@ export default function AddMcpSource(props: {
       });
       props.onComplete();
     } catch (e) {
-      setStdioError(e instanceof Error ? e.message : "Failed to add source");
+      setStdioError(await extractMcpClientErrorMessage(e, "Failed to add source"));
       setStdioAdding(false);
     } finally {
       placeholder.done();
@@ -686,7 +690,9 @@ export default function AddMcpSource(props: {
                     <CardStackEntryDescription>
                       {probe.connected
                         ? `${probe.toolCount} tool${probe.toolCount !== 1 ? "s" : ""} available`
-                        : "OAuth required to discover tools"}
+                        : probe.requiresOAuth
+                          ? "Authentication required to discover tools"
+                          : "Add authentication to discover tools"}
                     </CardStackEntryDescription>
                   </CardStackEntryContent>
                   <CardStackEntryActions>
@@ -702,7 +708,7 @@ export default function AddMcpSource(props: {
                         variant="outline"
                         className="border-amber-500/20 bg-amber-500/10 text-[10px] text-amber-600 dark:text-amber-400"
                       >
-                        OAuth required
+                        Auth required
                       </Badge>
                     )}
                   </CardStackEntryActions>
@@ -778,6 +784,8 @@ export default function AddMcpSource(props: {
                           { value: "header", label: "Header" },
                           { value: "oauth2", label: "OAuth" },
                         ]
+                      : probe.requiresAuthentication
+                        ? [{ value: "header", label: "Header" }]
                       : [
                           { value: "none", label: "None" },
                           { value: "header", label: "Header" },
@@ -858,18 +866,10 @@ export default function AddMcpSource(props: {
 
           {/* Error (OAuth / add source). Probe errors show inline on the field. */}
           {otherError && (
-            <div className="space-y-2">
+            <div>
               <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
                 <p className="text-[12px] text-destructive">{otherError}</p>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => dispatch({ type: "retry" })}
-                className="text-xs"
-              >
-                Try again
-              </Button>
             </div>
           )}
 
